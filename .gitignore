@@ -1,0 +1,20 @@
+# Secrets and Credentials
+config.json
+groups.json
+
+# Database files
+messages.db
+messages.db-wal
+messages.db-shm
+*.db
+
+# Dependencies
+node_modules/
+
+# Logs and runtime artifacts
+nohup.out
+*.log
+
+# Backups and temporary files
+*.bak
+.DS_Store
