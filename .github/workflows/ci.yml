@@ -18,6 +18,9 @@ jobs:
       - name: Mirror script tests
         run: sh tests/publish-mirror.sh
 
+      - name: Install dependencies
+        run: npm ci
+
       - name: Validate syntax
         run: |
           node --check bridge.js
