@@ -187,6 +187,12 @@ When an external contact sends you an iMessage:
   /new +1234567890
   ```
   The bot creates a group and confirms with: `Link established. You can now send iMessages to +1234567890 in this group.`
+- **Round-Trip Health Check ("Are You There?")**:
+  Send a direct message to the bot number:
+  ```text
+  are you there?
+  ```
+  *(or send `/ping` in DM or any group chat)*. The gateway tests round-trip connectivity to the macOS relay and returns the latency, macOS host info, and iMessage account connection status.
 
 ### Renaming Groups
 You can safely rename any created Signal group (e.g. change `iMessage: +1234567890` to `Alice Smith`). The gateway maps chats by their immutable Signal `groupId` stored in `groups.json`, not by title.

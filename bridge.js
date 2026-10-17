@@ -230,8 +230,18 @@ function startSignalDaemon() {
                                     await dispatchToMac(targetIMessageNumber, text, att.base64Data, att.mimeType, att.filename, signalSentTimestamp, groupId);
                                 }
                             } else if (msg.message && msg.message.trim().length > 0) {
-                                // Text-only message
-                                await dispatchToMac(targetIMessageNumber, msg.message, null, null, null, signalSentTimestamp, groupId);
+                                const trimmed = msg.message.trim();
+                                if (trimmed === '/ping' || trimmed === '/status') {
+                                    console.log(`[Command] Running round-trip health check in group ${groupId}...`);
+                                    const statusReply = await getRoundTripStatus();
+                                    await sendRpcCommand("send", {
+                                        message: statusReply,
+                                        groupId: groupId
+                                    });
+                                } else {
+                                    // Text-only message
+                                    await dispatchToMac(targetIMessageNumber, msg.message, null, null, null, signalSentTimestamp, groupId);
+                                }
                             }
                         }
                     } 
@@ -239,9 +249,11 @@ function startSignalDaemon() {
                     // --- SCENARIO B: Direct Message Command to the Bot ---
                     else if (!msg.groupInfo) {
                         const text = msg.message?.trim();
+                        if (!text) return;
+                        const lower = text.toLowerCase();
                         
                         // Listen for the "/new +1..." command
-                        if (text && text.startsWith('/new ')) {
+                        if (text.startsWith('/new ')) {
                             const newNumber = text.split(' ')[1]; // Extract the phone number/email
                             
                             if (groupMap[newNumber]) {
@@ -271,6 +283,35 @@ function startSignalDaemon() {
                                     console.error("[Error] Failed to create manual group:", err);
                                 }
                             }
+                        } else if (
+                            lower === 'are you there?' ||
+                            lower === 'are you there' ||
+                            lower === 'ping' ||
+                            lower === '/ping' ||
+                            lower === 'status' ||
+                            lower === '/status' ||
+                            lower === '/test'
+                        ) {
+                            console.log(`[Command] Running round-trip health check requested by primary phone...`);
+                            const statusReply = await getRoundTripStatus();
+                            await sendRpcCommand("send", {
+                                message: statusReply,
+                                recipient: [config.YOUR_PRIMARY_PHONE]
+                            });
+                        } else if (lower === '/help' || lower === 'help') {
+                            const helpMsg = [
+                                "Signal to iMessage Gateway Commands:",
+                                "",
+                                "• /new <phone_or_email>",
+                                "  Create a new mapped group for an iMessage contact.",
+                                "",
+                                "• are you there? (or /ping)",
+                                "  Test round-trip connectivity from your phone to the gateway and Mac relay."
+                            ].join('\n');
+                            await sendRpcCommand("send", {
+                                message: helpMsg,
+                                recipient: [config.YOUR_PRIMARY_PHONE]
+                            });
                         }
                     }
                 }
@@ -505,3 +546,63 @@ async function dispatchReactionToMac(recipient, originalMessageGuid, tapbackType
         console.error(`[Error] Failed to send reaction to Mac:`, error.message);
     }
 }
+
+// --- Helper: Round-Trip Status Check (Gateway -> Mac Relay) ---
+async function getRoundTripStatus() {
+    const t0 = Date.now();
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        const url = `http://${config.MAC_NEBULA_IP}:${config.MAC_PORT}/status`;
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${config.SHARED_TOKEN}`
+            },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        const latency = Date.now() - t0;
+        
+        if (!response.ok) {
+            return [
+                "⚠️ Gateway is online, but Mac relay returned an error:",
+                "",
+                "• Signal Gateway: Online",
+                `• Mac Relay: HTTP ${response.status} (${response.statusText || 'Error'})`,
+                `• Target: ${config.MAC_NEBULA_IP}:${config.MAC_PORT}`,
+                `• Latency: ${latency}ms`
+            ].join('\n');
+        }
+
+        const data = await response.json();
+        const imsg = data.imessage_account || (data.accounts && data.accounts.find(a => a.service === 'iMessage'));
+        const login = (imsg?.login || 'Unknown').replace(/^[A-Z]:/, '');
+        const conn = imsg?.connected ? 'Connected' : 'Disconnected';
+        const dconn = data.daemon_connected ? 'Connected' : 'Disconnected';
+        const osVersion = data.version || 'macOS';
+
+        return [
+            "Yes, I'm here! 🟢",
+            "",
+            "• Signal Gateway: Online",
+            `• Mac Relay: Online (${latency}ms round-trip)`,
+            `• macOS Host: ${osVersion}`,
+            `• iMessage: ${login} (${conn})`,
+            `• Apple Messages Daemon: ${dconn}`
+        ].join('\n');
+
+    } catch (err) {
+        const latency = Date.now() - t0;
+        const errMsg = err.name === 'AbortError' ? 'Timed out after 8s' : err.message;
+        return [
+            "⚠️ Gateway is online, but Mac relay is unreachable:",
+            "",
+            "• Signal Gateway: Online",
+            `• Mac Relay: Unreachable (${errMsg})`,
+            `• Target: ${config.MAC_NEBULA_IP}:${config.MAC_PORT}`,
+            `• Latency: ${latency}ms`
+        ].join('\n');
+    }
+}
+
