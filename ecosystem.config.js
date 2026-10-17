@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: 'signal-imessage-gateway',
     script: 'bridge.js',
-    cwd: '/usr/local/src/signal-imessage-gateway',
+    cwd: __dirname,
     exec_mode: 'fork',
     instances: 1,
     autorestart: true,

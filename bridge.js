@@ -11,7 +11,7 @@ const Database = require('better-sqlite3');
 const config = require('./config.json');
 const GROUPS_FILE = './groups.json';
 const DB_FILE = './messages.db';
-const SIGNAL_ATTACHMENTS_DIR = path.join(process.env.HOME || '/home/simrelay', '.local/share/signal-cli/attachments');
+const SIGNAL_ATTACHMENTS_DIR = path.join(os.homedir(), '.local/share/signal-cli/attachments');
 
 // --- SQLite Database Initialization ---
 const db = new Database(DB_FILE);
