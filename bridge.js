@@ -24,6 +24,33 @@ db.exec(`
         group_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_message_map_apple_guid ON message_map(apple_guid);
+
+    CREATE TABLE IF NOT EXISTS conversation_threads (
+        chat_id TEXT PRIMARY KEY,
+        signal_group_id TEXT,
+        is_group INTEGER DEFAULT 0,
+        name TEXT,
+        participants TEXT,
+        created_at TEXT,
+        updated_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_conv_signal_group_id ON conversation_threads(signal_group_id);
+
+    CREATE TABLE IF NOT EXISTS message_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        direction TEXT,
+        chat_id TEXT,
+        signal_group_id TEXT,
+        sender TEXT,
+        message TEXT,
+        has_attachment INTEGER DEFAULT 0,
+        apple_guid TEXT,
+        signal_timestamp TEXT,
+        created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_msg_history_chat_id ON message_history(chat_id);
+    CREATE INDEX IF NOT EXISTS idx_msg_history_apple_guid ON message_history(apple_guid);
+    CREATE INDEX IF NOT EXISTS idx_msg_history_signal_timestamp ON message_history(signal_timestamp);
 `);
 
 const insertMessageMap = db.prepare(`
@@ -35,6 +62,34 @@ const getMessageBySignalTimestamp = db.prepare(`
     SELECT signal_timestamp, apple_guid, group_id
     FROM message_map
     WHERE signal_timestamp = ?
+`);
+
+const upsertConversationThread = db.prepare(`
+    INSERT INTO conversation_threads (chat_id, signal_group_id, is_group, name, participants, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id) DO UPDATE SET
+        signal_group_id = excluded.signal_group_id,
+        is_group = excluded.is_group,
+        name = CASE WHEN excluded.name != '' THEN excluded.name ELSE conversation_threads.name END,
+        participants = CASE WHEN excluded.participants != '[]' THEN excluded.participants ELSE conversation_threads.participants END,
+        updated_at = excluded.updated_at
+`);
+
+const getConversationThread = db.prepare(`
+    SELECT chat_id, signal_group_id, is_group, name, participants, created_at, updated_at
+    FROM conversation_threads
+    WHERE chat_id = ?
+`);
+
+const getThreadByGroupId = db.prepare(`
+    SELECT chat_id, signal_group_id, is_group, name, participants, created_at, updated_at
+    FROM conversation_threads
+    WHERE signal_group_id = ?
+`);
+
+const insertMessageHistory = db.prepare(`
+    INSERT INTO message_history (direction, chat_id, signal_group_id, sender, message, has_attachment, apple_guid, signal_timestamp, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 // --- State Management ---
@@ -53,7 +108,14 @@ function saveMap() {
 }
 
 function getNumberFromGroupId(groupId) {
-    return Object.keys(groupMap).find(key => groupMap[key] === groupId);
+    if (!groupId) return null;
+    const direct = Object.keys(groupMap).find(key => groupMap[key] === groupId);
+    if (direct) return direct;
+    try {
+        const row = getThreadByGroupId.get(groupId);
+        if (row && row.chat_id) return row.chat_id;
+    } catch (e) {}
+    return null;
 }
 
 // Map emoji character to Apple Tapback type
@@ -231,11 +293,38 @@ function startSignalDaemon() {
                                 }
                             } else if (msg.message && msg.message.trim().length > 0) {
                                 const trimmed = msg.message.trim();
-                                if (trimmed === '/ping' || trimmed === '/status') {
+                                const lower = trimmed.toLowerCase();
+                                if (
+                                    lower === '/ping' ||
+                                    lower === '/status' ||
+                                    lower === 'are you there?' ||
+                                    lower === 'are you there' ||
+                                    lower === 'ping'
+                                ) {
                                     console.log(`[Command] Running round-trip health check in group ${groupId}...`);
                                     const statusReply = await getRoundTripStatus();
                                     await sendRpcCommand("send", {
                                         message: statusReply,
+                                        groupId: groupId
+                                    });
+                                } else if (lower === '/info' || lower === '/members' || lower === '/roster') {
+                                    const thread = getThreadByGroupId.get(groupId);
+                                    let reply = `Group Info:\n`;
+                                    if (thread) {
+                                        reply += `• iMessage ID: ${thread.chat_id}\n`;
+                                        if (thread.name) reply += `• Group Name: ${thread.name}\n`;
+                                        let members = [];
+                                        try { members = JSON.parse(thread.participants || '[]'); } catch (e) {}
+                                        if (members.length > 0) {
+                                            reply += `• Participants (${members.length}):\n` + members.map(m => `  - ${m}`).join('\n');
+                                        } else {
+                                            reply += `• Participants: (none recorded)`;
+                                        }
+                                    } else {
+                                        reply += `• Target: ${targetIMessageNumber || 'Unknown'}\n• Signal Group: ${groupId}`;
+                                    }
+                                    await sendRpcCommand("send", {
+                                        message: reply,
                                         groupId: groupId
                                     });
                                 } else {
@@ -305,8 +394,11 @@ function startSignalDaemon() {
                                 "• /new <phone_or_email>",
                                 "  Create a new mapped group for an iMessage contact.",
                                 "",
-                                "• are you there? (or /ping)",
-                                "  Test round-trip connectivity from your phone to the gateway and Mac relay."
+                                "• are you there? (or /ping, /status)",
+                                "  Test round-trip connectivity from your phone to the gateway and Mac relay.",
+                                "",
+                                "• /info (or /members, in a group thread)",
+                                "  Display participants roster and iMessage thread details."
                             ].join('\n');
                             await sendRpcCommand("send", {
                                 message: helpMsg,
@@ -368,14 +460,98 @@ app.use((req, res, next) => {
     else res.status(401).send("Unauthorized");
 });
 
+app.post('/admin/sync', async (req, res) => {
+    try {
+        const results = {};
+        // 1. Rename Weekend Camping group if needed
+        const groupChatId = 'chat123456789012345678';
+        const targetSignalId = groupMap[groupChatId];
+        if (targetSignalId) {
+            try {
+                const renameResult = await sendRpcCommand("updateGroup", {
+                    groupId: targetSignalId,
+                    name: "iMessage: Weekend Camping"
+                });
+                results.rename = { status: "success", result: renameResult };
+            } catch (renameErr) {
+                results.rename = { status: "error", message: renameErr.message };
+            }
+        }
+
+        // 2. Clean up orphan groups if requested
+        const orphanGroups = req.body.orphan_groups || [
+            "KWuktsAg4EOBgVTn7zRW16rcbtJH1+nI4YLxTl1wa70=",
+            "NvDq8IAM6BghgDcJegAl7VGZ9USTYdUTr7chFSjaciA=",
+            "FpQwAy9FUIV+BXeFnb4rXidjSG59ZcDSafgyxIF+QBY="
+        ];
+
+        results.orphans = [];
+        if (req.body.notify_orphans) {
+            for (const gid of orphanGroups) {
+                try {
+                    await sendRpcCommand("send", {
+                        message: "ℹ️ This 1-on-1 thread was created in error before group chat routing was active. All group messages are now delivered to 'iMessage: Weekend Camping'. You can safely delete or archive this conversation.",
+                        groupId: gid
+                    });
+                    results.orphans.push({ groupId: gid, notified: true });
+                } catch (e) {
+                    results.orphans.push({ groupId: gid, notified: false, error: e.message });
+                }
+            }
+        }
+
+        return res.json({ success: true, results });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/receive-imessage', async (req, res) => {
-    const rawSender = req.body.sender || req.body.chat_identifier || req.body.from || req.body.recipient;
-    if (!rawSender) return res.status(400).send("Sender required");
-    
-    // Normalize sender (strip iMessage;-; / SMS;-; / tel: prefixes if present)
-    const sender = rawSender.replace(/^(iMessage|SMS);-;/i, '').replace(/^tel:/i, '').trim();
+    // 1. Group vs 1-on-1 Detection
+    const isGroup = Boolean(
+        req.body.is_group === true ||
+        (req.body.group_chat_id && String(req.body.group_chat_id).trim().length > 0) ||
+        (req.body.chat_guid && String(req.body.chat_guid).includes(';+;')) ||
+        (req.body.sender && String(req.body.sender).startsWith('chat'))
+    );
+
+    // 2. Resolve Chat Key (thread identifier)
+    let chatKey = '';
+    if (isGroup) {
+        chatKey = (req.body.group_chat_id || req.body.chat_identifier || req.body.sender || '').trim();
+        chatKey = chatKey.replace(/^(iMessage|SMS);[+-];/i, '').replace(/^chat:/i, '').trim();
+    } else {
+        const rawSender = req.body.sender || req.body.chat_identifier || req.body.from || req.body.recipient;
+        if (!rawSender) return res.status(400).send("Sender required");
+        chatKey = rawSender.replace(/^(iMessage|SMS);[+-];/i, '').replace(/^tel:/i, '').trim();
+    }
+
+    if (!chatKey) {
+        return res.status(400).send("Chat identifier or sender required");
+    }
+
+    // 3. Sender / Correspondent Attribution
+    let author = '';
+    if (isGroup) {
+        const rawAuthor = req.body.correspondent || req.body.from || req.body.participant || '';
+        author = rawAuthor.replace(/^(iMessage|SMS);-;/i, '').replace(/^tel:/i, '').trim();
+    } else {
+        author = chatKey;
+    }
+
+    // 4. Participants Roster
+    let participants = [];
+    if (Array.isArray(req.body.participants) && req.body.participants.length > 0) {
+        participants = req.body.participants.map(p =>
+            String(p).replace(/^(iMessage|SMS);-;/i, '').replace(/^tel:/i, '').trim()
+        ).filter(Boolean);
+    } else if (author) {
+        participants = [author];
+    }
+
     const message = req.body.message || req.body.text || req.body.body || "";
     const messageGuid = req.body.message_guid || req.body.guid || null;
+    const groupName = req.body.group_name?.trim() || "";
 
     // Extract attachment supporting both Mac crapple-relay format and bridge format
     let base64Attachment = req.body.base64_data || req.body.attachment_base64 || req.body.attachment;
@@ -398,20 +574,63 @@ app.post('/receive-imessage', async (req, res) => {
     const localAttachmentPaths = [];
 
     try {
-        // 1. Resolve or Create Signal Group
-        let groupId = groupMap[sender] || groupMap[rawSender];
+        // 5. Resolve or Create Signal Group
+        let groupId = groupMap[chatKey];
+        const displayTitle = groupName
+            ? `iMessage: ${groupName}`
+            : (isGroup ? `iMessage Group: ${chatKey}` : `iMessage: ${chatKey}`);
+
         if (!groupId) {
-            console.log(`[Signal] Creating new group for ${sender}...`);
+            console.log(`[Signal] Creating new group for ${chatKey} (${displayTitle})...`);
             const groupResult = await sendRpcCommand("updateGroup", {
-                name: `iMessage: ${sender}`,
+                name: displayTitle,
                 members: [config.YOUR_PRIMARY_PHONE]
             });
             groupId = groupResult.groupId;
-            groupMap[sender] = groupId;
+            groupMap[chatKey] = groupId;
             saveMap();
+        } else if (isGroup && groupName) {
+            // Check if group title needs update
+            try {
+                const existingThread = getConversationThread.get(chatKey);
+                if (!existingThread || !existingThread.name || existingThread.name !== groupName) {
+                    await sendRpcCommand("updateGroup", {
+                        groupId: groupId,
+                        name: displayTitle
+                    });
+                    console.log(`[Signal] Updated group title to "${displayTitle}" for ${chatKey}`);
+                }
+            } catch (renameErr) {
+                console.warn(`[Signal] Note on group rename:`, renameErr.message);
+            }
         }
 
-        // 2. Handle Attachments (Mac -> Signal)
+        // 6. Update Conversation Thread Roster in SQLite
+        try {
+            upsertConversationThread.run(
+                chatKey,
+                groupId,
+                isGroup ? 1 : 0,
+                groupName,
+                JSON.stringify(participants),
+                new Date().toISOString(),
+                new Date().toISOString()
+            );
+        } catch (threadErr) {
+            console.error(`[Database] Failed to upsert thread record:`, threadErr.message);
+        }
+
+        // 7. Format Message with Attribution for Groups
+        let signalMessageText = message;
+        if (isGroup && author) {
+            if (signalMessageText && signalMessageText.trim().length > 0) {
+                signalMessageText = `[${author}]: ${signalMessageText}`;
+            } else {
+                signalMessageText = `[${author}]`;
+            }
+        }
+
+        // 8. Handle Attachments (Mac -> Signal)
         if (base64Attachment) {
             let safeName = filename ? path.basename(filename) : `incoming_${Date.now()}`;
             if (!path.extname(safeName)) {
@@ -420,12 +639,12 @@ app.post('/receive-imessage', async (req, res) => {
             const tempPath = path.join('/tmp', `${Date.now()}_${safeName}`);
             fs.writeFileSync(tempPath, Buffer.from(base64Attachment, 'base64'));
             localAttachmentPaths.push(tempPath);
-            console.log(`[Signal] Saved incoming attachment for ${sender}: ${tempPath} (${mimeType || 'unknown mime'})`);
+            console.log(`[Signal] Saved incoming attachment for ${chatKey}: ${tempPath} (${mimeType || 'unknown mime'})`);
         }
 
-        // 3. Dispatch to Signal Group
+        // 9. Dispatch to Signal Group
         const rpcParams = {
-            message: message || "",
+            message: signalMessageText || "",
             groupId: groupId
         };
         if (localAttachmentPaths.length > 0) {
@@ -433,9 +652,9 @@ app.post('/receive-imessage', async (req, res) => {
         }
 
         const sendResult = await sendRpcCommand("send", rpcParams);
-        console.log(`[Signal] Successfully routed message from ${sender} (attachments: ${localAttachmentPaths.length})`);
+        console.log(`[Signal] Successfully routed message for ${chatKey} from ${author || chatKey} (attachments: ${localAttachmentPaths.length})`);
 
-        // 4. Map Signal Timestamp to Apple Message GUID in SQLite
+        // 10. Map Signal Timestamp to Apple Message GUID in SQLite
         const signalTimestamp = (sendResult && typeof sendResult === 'object') ? sendResult.timestamp : sendResult;
         if (signalTimestamp && messageGuid) {
             try {
@@ -446,10 +665,27 @@ app.post('/receive-imessage', async (req, res) => {
             }
         }
 
+        // 11. Record into message_history
+        try {
+            insertMessageHistory.run(
+                'inbound',
+                chatKey,
+                groupId,
+                author || chatKey,
+                message || '',
+                localAttachmentPaths.length > 0 ? 1 : 0,
+                messageGuid ? String(messageGuid) : null,
+                signalTimestamp ? String(signalTimestamp) : null,
+                new Date().toISOString()
+            );
+        } catch (histErr) {
+            console.error(`[Database] Failed to record message history:`, histErr.message);
+        }
+
     } catch (err) {
         console.error(`[Error] Failed to route iMessage to Signal:`, err);
     } finally {
-        // 5. Always cleanup temp files
+        // 12. Always cleanup temp files
         localAttachmentPaths.forEach(p => {
             try {
                 if (fs.existsSync(p)) fs.unlinkSync(p);
@@ -472,7 +708,10 @@ async function dispatchToMac(targetNumber, messageText, base64Data, mimeType, fi
         return;
     }
 
-    const payload = { recipient: targetNumber };
+    const payload = {
+        recipient: targetNumber,
+        chat_identifier: targetNumber
+    };
     if (messageText) payload.message = messageText;
 
     if (base64Data) {
@@ -514,6 +753,23 @@ async function dispatchToMac(targetNumber, messageText, base64Data, mimeType, fi
                 console.error(`[Database] Failed to insert mapping:`, dbErr.message);
             }
         }
+
+        // Record in message_history
+        try {
+            insertMessageHistory.run(
+                'outbound',
+                targetNumber,
+                groupId || null,
+                config.YOUR_PRIMARY_PHONE,
+                messageText || '',
+                base64Data ? 1 : 0,
+                appleGuid ? String(appleGuid) : null,
+                signalSentTimestamp ? String(signalSentTimestamp) : null,
+                new Date().toISOString()
+            );
+        } catch (histErr) {
+            console.error(`[Database] Failed to record outbound history:`, histErr.message);
+        }
     } catch (error) {
         console.error(`[Error] Failed to reach Mac:`, error.message);
     }
@@ -524,6 +780,7 @@ async function dispatchReactionToMac(recipient, originalMessageGuid, tapbackType
     const url = `http://${config.MAC_NEBULA_IP}:${config.MAC_PORT}/react`;
     const payload = {
         recipient: recipient,
+        chat_identifier: recipient,
         original_message_guid: originalMessageGuid,
         tapback_type: tapbackType
     };
@@ -580,14 +837,16 @@ async function getRoundTripStatus() {
         const login = (imsg?.login || 'Unknown').replace(/^[A-Z]:/, '');
         const conn = imsg?.connected ? 'Connected' : 'Disconnected';
         const dconn = data.daemon_connected ? 'Connected' : 'Disconnected';
-        const osVersion = data.version || 'macOS';
+        const relayVer = data.relay_version || data.relay_version_string || data.version || 'Unknown';
+        const macosVer = data.macos_version || data.os_version || 'macOS';
 
         return [
             "Yes, I'm here! 🟢",
             "",
             "• Signal Gateway: Online",
             `• Mac Relay: Online (${latency}ms round-trip)`,
-            `• macOS Host: ${osVersion}`,
+            `• Relay Version: ${relayVer}`,
+            `• macOS Host: ${macosVer}`,
             `• iMessage: ${login} (${conn})`,
             `• Apple Messages Daemon: ${dconn}`
         ].join('\n');

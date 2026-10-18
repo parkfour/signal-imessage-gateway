@@ -35,10 +35,12 @@ A lightweight bidirectional gateway bridging Signal and Apple iMessage. It allow
 ## Features
 
 - **Bidirectional Messaging**: Send and receive text messages seamlessly between Signal and iMessage.
+- **Multi-Party Group Chats**: Supports iMessage multi-party group chats with automatic thread creation, roster synchronization, and clear inbound sender attribution (`[<sender>]: <message>`). Outbound replies route directly back to the iMessage group without requiring sender prefixes.
 - **Media Support**: Transfer images (JPEG, PNG, HEIC, GIF, WebP) and videos (MP4, MOV).
-- **Reaction (Tapback) Routing**: Signal emoji reactions (❤️, 👍, 👎, 😂, ‼️, ❓) are mapped directly to native Apple Tapbacks (Love, Like, Dislike, Laugh, Emphasize, Question).
-- **Persistent State**: SQLite database (`messages.db`) with WAL mode maps Signal message timestamps to Apple message GUIDs.
-- **Dedicated Signal Groups**: Every iMessage contact maps to a private 1-on-1 Signal group between you and the gateway bot. You can rename the groups anytime in Signal without breaking routing.
+- **Reaction (Tapback) Routing**: Signal emoji reactions (❤️, 👍, 👎, 😂, ‼️, ❓) are mapped directly to native Apple Tapbacks (Love, Like, Dislike, Laugh, Emphasize, Question) in both 1-on-1 and group chats.
+- **Persistent State**: SQLite database (`messages.db`) with WAL mode stores thread rosters, message history, and maps Signal timestamps to Apple message GUIDs.
+- **Dedicated Signal Groups**: Every iMessage contact or group chat maps to a private Signal group between you and the gateway bot. You can rename the groups anytime in Signal without breaking routing.
+- **Interactive Commands**: Test round-trip health check anytime (`are you there?` or `/ping`), inspect group rosters (`/info` or `/members`), and link new contacts (`/new <number>`).
 
 ---
 
@@ -225,17 +227,45 @@ Sent by the Mac daemon to the gateway when an iMessage is received.
   Authorization: Bearer <SHARED_TOKEN>
   Content-Type: application/json
   ```
-- **Body**:
-  ```json
-  {
-    "sender": "+1234567890",
-    "message": "Hello from iMessage!",
-    "message_guid": "7E1F9B3D-1234-4567-89AB-CDEF01234567",
-    "base64_data": "iVBORw0KGgoAAAANSUhEUg...",
-    "mime_type": "image/jpeg",
-    "filename": "photo.jpg"
-  }
-  ```
+
+#### Multi-Party Group Chat Payload (crapple-relay v0.2.0+)
+```json
+{
+  "sender": "chat123456789012345678",
+  "group_chat_id": "chat123456789012345678",
+  "correspondent": "alice@example.com",
+  "from": "alice@example.com",
+  "participant": "alice@example.com",
+  "participants": [
+    "+15551234567",
+    "+15552345678",
+    "alice@example.com",
+    "+15553456789"
+  ],
+  "is_group": true,
+  "chat_identifier": "chat123456789012345678",
+  "chat_guid": "iMessage;+;chat123456789012345678",
+  "group_name": "Weekend Camping",
+  "message": "Sounds like a great plan! Looking forward to it.",
+  "message_guid": "4E5D720D-3867-49C6-974D-9181ACC2829F",
+  "attachment_base64": "",
+  "attachment_mime": "",
+  "attachment_name": ""
+}
+```
+
+#### Standard 1-on-1 Payload
+```json
+{
+  "sender": "+1234567890",
+  "message": "Hello from iMessage!",
+  "message_guid": "7E1F9B3D-1234-4567-89AB-CDEF01234567",
+  "is_group": false,
+  "base64_data": "iVBORw0KGgoAAAANSUhEUg...",
+  "mime_type": "image/jpeg",
+  "filename": "photo.jpg"
+}
+```
 
 ### 2. Outbound to Mac: `POST /send`
 Sent by the gateway to the Mac daemon to deliver an iMessage.
@@ -292,8 +322,11 @@ Sent by the gateway to the Mac daemon when you react to a message in Signal.
 ├── ecosystem.config.js    # PM2 process configuration
 ├── config.json            # Active credentials and networking config (gitignored)
 ├── config.example.json    # Template configuration file
-├── groups.json            # Mapping of phone numbers to Signal group IDs (gitignored)
-├── messages.db            # SQLite database mapping Signal timestamps to Apple GUIDs (gitignored)
+├── groups.json            # Mapping of phone numbers/groups to Signal group IDs (gitignored)
+├── messages.db            # SQLite database for threads, message history & Apple GUID mappings (gitignored)
+├── scripts/
+│   ├── migrate-group-chats.js # Historical group chat database migration & cleanup
+│   └── publish-mirror.sh      # Git mirror synchronization
 ├── package.json           # Node.js dependencies
 └── README.md              # Project documentation
 ```
