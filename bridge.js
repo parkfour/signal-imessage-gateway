@@ -200,6 +200,9 @@ function startSignalDaemon() {
         setTimeout(startSignalDaemon, 3000);
     });
 
+    // Check if we need to send a post-restart confirmation to Signal
+    setTimeout(checkRestartNotification, 3500);
+
     // Parse incoming Signal messages
     signalStdout.on('line', async (line) => {
         try {
@@ -327,6 +330,19 @@ function startSignalDaemon() {
                                         message: reply,
                                         groupId: groupId
                                     });
+                                } else if (
+                                    lower === '/restart' ||
+                                    lower === 'restart' ||
+                                    lower.startsWith('/restart ') ||
+                                    lower.startsWith('restart ')
+                                ) {
+                                    const parts = trimmed.split(/\s+/);
+                                    const arg = parts.slice(1).join(' ').trim();
+                                    const sendReply = async (message) => {
+                                        await sendRpcCommand("send", { message, groupId });
+                                    };
+                                    sendReply.target = { groupId };
+                                    await handleRestartCommand(sendReply, arg);
                                 } else {
                                     // Text-only message
                                     await dispatchToMac(targetIMessageNumber, msg.message, null, null, null, signalSentTimestamp, groupId);
@@ -387,6 +403,22 @@ function startSignalDaemon() {
                                 message: statusReply,
                                 recipient: [config.YOUR_PRIMARY_PHONE]
                             });
+                        } else if (
+                            lower === '/restart' ||
+                            lower === 'restart' ||
+                            lower.startsWith('/restart ') ||
+                            lower.startsWith('restart ')
+                        ) {
+                            const parts = text.split(/\s+/);
+                            const arg = parts.slice(1).join(' ').trim();
+                            const sendReply = async (message) => {
+                                await sendRpcCommand("send", {
+                                    message,
+                                    recipient: [config.YOUR_PRIMARY_PHONE]
+                                });
+                            };
+                            sendReply.target = { recipient: [config.YOUR_PRIMARY_PHONE] };
+                            await handleRestartCommand(sendReply, arg);
                         } else if (lower === '/help' || lower === 'help') {
                             const helpMsg = [
                                 "Signal to iMessage Gateway Commands:",
@@ -396,6 +428,9 @@ function startSignalDaemon() {
                                 "",
                                 "• are you there? (or /ping, /status)",
                                 "  Test round-trip connectivity from your phone to the gateway and Mac relay.",
+                                "",
+                                "• /restart (or /restart both, /restart mac)",
+                                "  Restart the gateway daemon, or both Mac relay and gateway.",
                                 "",
                                 "• /info (or /members, in a group thread)",
                                 "  Display participants roster and iMessage thread details."
@@ -503,6 +538,21 @@ app.post('/admin/sync', async (req, res) => {
         return res.json({ success: true, results });
     } catch (err) {
         return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/restart', async (req, res) => {
+    const target = (req.body?.target || req.query?.target || 'gateway').toString().trim().toLowerCase();
+    res.status(200).json({ status: "initiating_restart", target });
+
+    if (target === 'both' || target === 'all') {
+        triggerMacRestart().finally(() => {
+            restartSelf(1500);
+        });
+    } else if (target === 'mac' || target === 'relay') {
+        triggerMacRestart();
+    } else {
+        restartSelf(1000);
     }
 });
 
@@ -863,5 +913,136 @@ async function getRoundTripStatus() {
             `• Latency: ${latency}ms`
         ].join('\n');
     }
+}
+
+// --- Restart Commands and State Management ---
+const RESTART_MARKER_FILE = path.join(os.tmpdir(), 'signal_gateway_restart_marker.json');
+
+async function triggerMacRestart() {
+    const url = `http://${config.MAC_NEBULA_IP}:${config.MAC_PORT}/restart`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+        console.log(`[Mac] Requesting Mac relay restart at ${url}...`);
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${config.SHARED_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            signal: controller.signal
+        });
+        clearTimeout(timer);
+        if (!response.ok) {
+            const errText = await response.text().catch(() => '');
+            return { ok: false, error: `HTTP ${response.status}: ${errText || response.statusText}` };
+        }
+        const data = await response.json().catch(() => ({}));
+        return { ok: true, data };
+    } catch (err) {
+        clearTimeout(timer);
+        // If daemon terminates immediately, connection reset/abort is expected
+        if (err.name === 'AbortError' || err.code === 'ECONNRESET' || err.message?.includes('socket hang up')) {
+            console.log(`[Mac] Restart request dispatched; connection closed or timed out as expected during reset.`);
+            return { ok: true, note: 'Restart command dispatched (connection reset during daemon reload)' };
+        }
+        return { ok: false, error: err.message };
+    }
+}
+
+function restartSelf(delayMs = 1500) {
+    console.log(`[System] Restarting gateway daemon in ${delayMs}ms...`);
+    setTimeout(() => {
+        if (signalDaemon) {
+            signalDaemon.removeAllListeners('exit');
+            try {
+                signalDaemon.kill('SIGTERM');
+            } catch (e) {}
+        }
+        process.exit(0);
+    }, delayMs);
+}
+
+function saveRestartMarker(target, both = false) {
+    try {
+        fs.writeFileSync(RESTART_MARKER_FILE, JSON.stringify({
+            target: target,
+            both: both,
+            timestamp: Date.now()
+        }));
+        console.log(`[System] Saved restart marker for target:`, target);
+    } catch (e) {
+        console.error("[System] Failed to write restart marker:", e.message);
+    }
+}
+
+async function checkRestartNotification() {
+    if (!fs.existsSync(RESTART_MARKER_FILE)) return;
+    try {
+        const marker = JSON.parse(fs.readFileSync(RESTART_MARKER_FILE, 'utf8'));
+        fs.unlinkSync(RESTART_MARKER_FILE);
+
+        // Only send confirmation if restarted recently (within 2 minutes)
+        if (Date.now() - marker.timestamp < 120000) {
+            console.log("[System] Found active restart marker. Checking round-trip status...");
+            const statusReply = await getRoundTripStatus();
+            const header = marker.both
+                ? "🟢 Both iMessage relay and Signal gateway have restarted successfully!"
+                : "🟢 Signal gateway daemon has restarted successfully!";
+            const fullMsg = `${header}\n\n${statusReply}`;
+
+            const rpcParams = { message: fullMsg };
+            if (marker.target?.groupId) {
+                rpcParams.groupId = marker.target.groupId;
+            } else if (marker.target?.recipient) {
+                rpcParams.recipient = marker.target.recipient;
+            } else {
+                rpcParams.recipient = [config.YOUR_PRIMARY_PHONE];
+            }
+
+            await sendRpcCommand("send", rpcParams).catch(err => {
+                console.error("[System] Failed to deliver post-restart notification:", err.message);
+            });
+        }
+    } catch (e) {
+        console.error("[System] Error processing restart marker:", e.message);
+    }
+}
+
+async function handleRestartCommand(sendReply, arg = '') {
+    const normalized = (arg || '').trim().toLowerCase();
+
+    if (normalized === 'both' || normalized === 'all') {
+        await sendReply("🔄 [1/2] Triggering restart on iMessage Mac relay...");
+        const macResult = await triggerMacRestart();
+        if (macResult.ok) {
+            await sendReply("✅ Mac relay restart initiated.\n🔄 [2/2] Restarting Signal gateway in 2s...");
+        } else {
+            await sendReply(`⚠️ Mac relay restart returned: ${macResult.error}\n🔄 Proceeding to restart Signal gateway in 2s...`);
+        }
+        saveRestartMarker(sendReply.target, true);
+        restartSelf(2000);
+        return;
+    }
+
+    if (normalized === 'mac' || normalized === 'relay') {
+        await sendReply("🔄 Triggering restart of iMessage Mac relay...");
+        const macResult = await triggerMacRestart();
+        if (!macResult.ok) {
+            await sendReply(`⚠️ Failed to trigger Mac relay restart: ${macResult.error}`);
+            return;
+        }
+        await sendReply("✅ Mac relay restart signal sent. Verifying connectivity in 6s...");
+        setTimeout(async () => {
+            const status = await getRoundTripStatus();
+            await sendReply(`Mac Relay Status:\n\n${status}`);
+        }, 6000);
+        return;
+    }
+
+    // Default: Restart gateway only
+    await sendReply("🔄 Restarting Signal-iMessage gateway daemon in 1s...");
+    saveRestartMarker(sendReply.target, false);
+    restartSelf(1500);
 }
 

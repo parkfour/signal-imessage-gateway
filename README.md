@@ -40,7 +40,7 @@ A lightweight bidirectional gateway bridging Signal and Apple iMessage. It allow
 - **Reaction (Tapback) Routing**: Signal emoji reactions (❤️, 👍, 👎, 😂, ‼️, ❓) are mapped directly to native Apple Tapbacks (Love, Like, Dislike, Laugh, Emphasize, Question) in both 1-on-1 and group chats.
 - **Persistent State**: SQLite database (`messages.db`) with WAL mode stores thread rosters, message history, and maps Signal timestamps to Apple message GUIDs.
 - **Dedicated Signal Groups**: Every iMessage contact or group chat maps to a private Signal group between you and the gateway bot. You can rename the groups anytime in Signal without breaking routing.
-- **Interactive Commands**: Test round-trip health check anytime (`are you there?` or `/ping`), inspect group rosters (`/info` or `/members`), and link new contacts (`/new <number>`).
+- **Interactive Commands**: Test round-trip health check anytime (`are you there?` or `/ping`), restart services (`/restart`, `/restart both`, `/restart mac`), inspect group rosters (`/info` or `/members`), and link new contacts (`/new <number>`).
 
 ---
 
@@ -312,6 +312,23 @@ Sent by the gateway to the Mac daemon when you react to a message in Signal.
   }
   ```
   *(Valid `tapback_type` values: `"Love"`, `"Like"`, `"Dislike"`, `"Laugh"`, `"Emphasize"`, `"Question"`)*
+
+### 4. Remote Restart Endpoint: `POST /restart`
+Supported on both the gateway and Mac relay daemon to trigger service reboots remotely.
+
+- **URL**: `http://<host-ip>:<port>/restart`
+- **Headers**:
+  ```http
+  Authorization: Bearer <SHARED_TOKEN>
+  Content-Type: application/json
+  ```
+- **Body** (optional):
+  ```json
+  {
+    "target": "gateway"
+  }
+  ```
+  *(Valid `target` values: `"gateway"` (default), `"mac"` / `"relay"`, `"both"` / `"all"`)*
 
 ---
 
