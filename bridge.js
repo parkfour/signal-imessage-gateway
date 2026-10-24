@@ -498,34 +498,33 @@ app.use((req, res, next) => {
 app.post('/admin/sync', async (req, res) => {
     try {
         const results = {};
-        // 1. Rename Weekend Camping group if needed
-        const groupChatId = 'chat123456789012345678';
-        const targetSignalId = groupMap[groupChatId];
-        if (targetSignalId) {
-            try {
-                const renameResult = await sendRpcCommand("updateGroup", {
-                    groupId: targetSignalId,
-                    name: "iMessage: Weekend Camping"
-                });
-                results.rename = { status: "success", result: renameResult };
-            } catch (renameErr) {
-                results.rename = { status: "error", message: renameErr.message };
+        // 1. Rename group if requested
+        const groupChatId = req.body?.group_chat_id;
+        const groupName = req.body?.name || (groupChatId ? `iMessage: ${groupChatId}` : null);
+        if (groupChatId && groupName) {
+            const targetSignalId = groupMap[groupChatId];
+            if (targetSignalId) {
+                try {
+                    const renameResult = await sendRpcCommand("updateGroup", {
+                        groupId: targetSignalId,
+                        name: groupName
+                    });
+                    results.rename = { status: "success", result: renameResult };
+                } catch (renameErr) {
+                    results.rename = { status: "error", message: renameErr.message };
+                }
             }
         }
 
-        // 2. Clean up orphan groups if requested
-        const orphanGroups = req.body.orphan_groups || [
-            "KWuktsAg4EOBgVTn7zRW16rcbtJH1+nI4YLxTl1wa70=",
-            "NvDq8IAM6BghgDcJegAl7VGZ9USTYdUTr7chFSjaciA=",
-            "FpQwAy9FUIV+BXeFnb4rXidjSG59ZcDSafgyxIF+QBY="
-        ];
-
+        // 2. Clean up / notify orphan groups if requested
+        const orphanGroups = req.body?.orphan_groups || [];
         results.orphans = [];
-        if (req.body.notify_orphans) {
+        if (req.body?.notify_orphans && Array.isArray(orphanGroups)) {
+            const notifyMsg = req.body?.message || "ℹ️ This 1-on-1 thread was created in error before group chat routing was active. You can safely delete or archive this conversation.";
             for (const gid of orphanGroups) {
                 try {
                     await sendRpcCommand("send", {
-                        message: "ℹ️ This 1-on-1 thread was created in error before group chat routing was active. All group messages are now delivered to 'iMessage: Weekend Camping'. You can safely delete or archive this conversation.",
+                        message: notifyMsg,
                         groupId: gid
                     });
                     results.orphans.push({ groupId: gid, notified: true });

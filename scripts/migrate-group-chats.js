@@ -4,9 +4,8 @@
  * Migration & Cleanup Script: Group Chat Routing
  * 
  * Migrates historical messages from misrouted 1-on-1 contact threads into
- * the proper group chat thread (chat123456789012345678), registers the
- * group conversation and participant roster in SQLite, and cleans up
- * orphaned 1-on-1 entries in groups.json.
+ * the proper group chat thread, registers the group conversation and participant
+ * roster in SQLite, and cleans up orphaned 1-on-1 entries in groups.json.
  */
 
 const fs = require('fs');
@@ -62,10 +61,10 @@ db.exec(`
 
 console.log('[SQLite] Schema verified and up to date.');
 
-// 2. Upsert the Weekend Camping group thread
-const GROUP_CHAT_ID = 'chat123456789012345678';
-const SIGNAL_GROUP_ID = 'bqxgSplJj+Scz/xt6PFU8k2O+fCjCg9FthMdN4z0E7Y=';
-const GROUP_NAME = 'Weekend Camping';
+// 2. Upsert the example group thread
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || 'chat123456789012345678';
+const SIGNAL_GROUP_ID = process.env.SIGNAL_GROUP_ID || 'EXAMPLE_BASE64_SIGNAL_GROUP_ID==';
+const GROUP_NAME = process.env.GROUP_NAME || 'Weekend Camping';
 const PARTICIPANTS = [
     '+15551234567',
     '+15552345678',
