@@ -10,6 +10,7 @@ const Database = require('better-sqlite3');
 // --- Configuration ---
 const config = require('./config.json');
 const GROUPS_FILE = './groups.json';
+const CONTACTS_FILE = './contacts.json';
 const DB_FILE = './messages.db';
 const SIGNAL_ATTACHMENTS_DIR = path.join(os.homedir(), '.local/share/signal-cli/attachments');
 
@@ -105,6 +106,61 @@ if (fs.existsSync(GROUPS_FILE)) {
 
 function saveMap() {
     fs.writeFileSync(GROUPS_FILE, JSON.stringify(groupMap, null, 2));
+}
+
+// Maps iMessage Phone Number / Email -> Nickname
+let contactsMap = {};
+let lastContactsMtime = 0;
+
+function loadContacts() {
+    if (fs.existsSync(CONTACTS_FILE)) {
+        try {
+            const stats = fs.statSync(CONTACTS_FILE);
+            if (stats.mtimeMs !== lastContactsMtime) {
+                contactsMap = JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8'));
+                lastContactsMtime = stats.mtimeMs;
+            }
+        } catch (e) {
+            console.error("[System] Failed to parse contacts.json:", e.message);
+        }
+    } else {
+        contactsMap = {};
+    }
+}
+loadContacts();
+
+function saveContacts() {
+    try {
+        fs.writeFileSync(CONTACTS_FILE, JSON.stringify(contactsMap, null, 2));
+        const stats = fs.statSync(CONTACTS_FILE);
+        lastContactsMtime = stats.mtimeMs;
+    } catch (e) {
+        console.error("[System] Failed to save contacts.json:", e.message);
+    }
+}
+
+function resolveContactName(handle) {
+    if (!handle) return '';
+    loadContacts();
+    const raw = String(handle).trim();
+    // 1. Direct match
+    if (contactsMap[raw]) return contactsMap[raw];
+    // 2. Case-insensitive email match
+    const lower = raw.toLowerCase();
+    for (const [k, v] of Object.entries(contactsMap)) {
+        if (k.toLowerCase() === lower) return v;
+    }
+    // 3. Normalized phone match (digits only comparison)
+    const digitsOnlyRaw = raw.replace(/\D/g, '');
+    if (digitsOnlyRaw.length >= 7) {
+        for (const [k, v] of Object.entries(contactsMap)) {
+            const digitsOnlyK = k.replace(/\D/g, '');
+            if (digitsOnlyK && (digitsOnlyK === digitsOnlyRaw || digitsOnlyRaw.endsWith(digitsOnlyK) || digitsOnlyK.endsWith(digitsOnlyRaw))) {
+                return v;
+            }
+        }
+    }
+    return raw;
 }
 
 function getNumberFromGroupId(groupId) {
@@ -319,17 +375,39 @@ function startSignalDaemon() {
                                         let members = [];
                                         try { members = JSON.parse(thread.participants || '[]'); } catch (e) {}
                                         if (members.length > 0) {
-                                            reply += `• Participants (${members.length}):\n` + members.map(m => `  - ${m}`).join('\n');
+                                            reply += `• Participants (${members.length}):\n` + members.map(m => {
+                                                const name = resolveContactName(m);
+                                                return (name && name !== m) ? `  - ${name} (${m})` : `  - ${m}`;
+                                            }).join('\n');
                                         } else {
                                             reply += `• Participants: (none recorded)`;
                                         }
                                     } else {
-                                        reply += `• Target: ${targetIMessageNumber || 'Unknown'}\n• Signal Group: ${groupId}`;
+                                        const name = resolveContactName(targetIMessageNumber);
+                                        const label = (name && name !== targetIMessageNumber) ? `${name} (${targetIMessageNumber})` : (targetIMessageNumber || 'Unknown');
+                                        reply += `• Target: ${label}\n• Signal Group: ${groupId}`;
                                     }
                                     await sendRpcCommand("send", {
                                         message: reply,
                                         groupId: groupId
                                     });
+                                } else if (
+                                    lower === '/name' ||
+                                    lower.startsWith('/name ') ||
+                                    lower === '/alias' ||
+                                    lower.startsWith('/alias ') ||
+                                    lower === '/names' ||
+                                    lower === '/contacts'
+                                ) {
+                                    const sendReply = async (message) => {
+                                        await sendRpcCommand("send", { message, groupId });
+                                    };
+                                    await handleNameCommand(sendReply, trimmed, targetIMessageNumber, groupId);
+                                } else if (lower.startsWith('/delname ') || lower.startsWith('/unname ')) {
+                                    const sendReply = async (message) => {
+                                        await sendRpcCommand("send", { message, groupId });
+                                    };
+                                    await handleDeleteNameCommand(sendReply, trimmed);
                                 } else if (
                                     lower === '/restart' ||
                                     lower === 'restart' ||
@@ -369,9 +447,11 @@ function startSignalDaemon() {
                             } else {
                                 console.log(`[System] Creating manual group for ${newNumber}...`);
                                 try {
+                                    const contactName = resolveContactName(newNumber);
+                                    const displayName = (contactName && contactName !== newNumber) ? contactName : newNumber;
                                     // Create the new Signal group
                                     const groupResult = await sendRpcCommand("updateGroup", {
-                                        name: `iMessage: ${newNumber}`,
+                                        name: `iMessage: ${displayName}`,
                                         members: [config.YOUR_PRIMARY_PHONE]
                                     });
                                     
@@ -419,12 +499,42 @@ function startSignalDaemon() {
                             };
                             sendReply.target = { recipient: [config.YOUR_PRIMARY_PHONE] };
                             await handleRestartCommand(sendReply, arg);
+                        } else if (
+                            lower === '/name' ||
+                            lower.startsWith('/name ') ||
+                            lower === '/alias' ||
+                            lower.startsWith('/alias ') ||
+                            lower === '/names' ||
+                            lower === '/contacts'
+                        ) {
+                            const sendReply = async (message) => {
+                                await sendRpcCommand("send", {
+                                    message,
+                                    recipient: [config.YOUR_PRIMARY_PHONE]
+                                });
+                            };
+                            await handleNameCommand(sendReply, text, null, null);
+                        } else if (lower.startsWith('/delname ') || lower.startsWith('/unname ')) {
+                            const sendReply = async (message) => {
+                                await sendRpcCommand("send", {
+                                    message,
+                                    recipient: [config.YOUR_PRIMARY_PHONE]
+                                });
+                            };
+                            await handleDeleteNameCommand(sendReply, text);
                         } else if (lower === '/help' || lower === 'help') {
                             const helpMsg = [
                                 "Signal to iMessage Gateway Commands:",
                                 "",
                                 "• /new <phone_or_email>",
                                 "  Create a new mapped group for an iMessage contact.",
+                                "",
+                                "• /name <phone_or_email> <nickname>",
+                                "  Set a friendly nickname for a contact (e.g. /name +15551234567 Alice).",
+                                "  (Inside a 1-on-1 chat, simply '/name <nickname>' renames that contact).",
+                                "",
+                                "• /contacts (or /names)",
+                                "  List all configured nicknames.",
                                 "",
                                 "• are you there? (or /ping, /status)",
                                 "  Test round-trip connectivity from your phone to the gateway and Mac relay.",
@@ -625,9 +735,10 @@ app.post('/receive-imessage', async (req, res) => {
     try {
         // 5. Resolve or Create Signal Group
         let groupId = groupMap[chatKey];
+        const contactName = !isGroup ? resolveContactName(chatKey) : '';
         const displayTitle = groupName
             ? `iMessage: ${groupName}`
-            : (isGroup ? `iMessage Group: ${chatKey}` : `iMessage: ${chatKey}`);
+            : (isGroup ? `iMessage Group: ${chatKey}` : `iMessage: ${contactName || chatKey}`);
 
         if (!groupId) {
             console.log(`[Signal] Creating new group for ${chatKey} (${displayTitle})...`);
@@ -672,10 +783,11 @@ app.post('/receive-imessage', async (req, res) => {
         // 7. Format Message with Attribution for Groups
         let signalMessageText = message;
         if (isGroup && author) {
+            const displayName = resolveContactName(author);
             if (signalMessageText && signalMessageText.trim().length > 0) {
-                signalMessageText = `[${author}]: ${signalMessageText}`;
+                signalMessageText = `[${displayName}]: ${signalMessageText}`;
             } else {
-                signalMessageText = `[${author}]`;
+                signalMessageText = `[${displayName}]`;
             }
         }
 
@@ -701,7 +813,8 @@ app.post('/receive-imessage', async (req, res) => {
         }
 
         const sendResult = await sendRpcCommand("send", rpcParams);
-        console.log(`[Signal] Successfully routed message for ${chatKey} from ${author || chatKey} (attachments: ${localAttachmentPaths.length})`);
+        const displayName = resolveContactName(author || chatKey);
+        console.log(`[Signal] Successfully routed message for ${chatKey} from ${displayName} (attachments: ${localAttachmentPaths.length})`);
 
         // 10. Map Signal Timestamp to Apple Message GUID in SQLite
         const signalTimestamp = (sendResult && typeof sendResult === 'object') ? sendResult.timestamp : sendResult;
@@ -720,7 +833,7 @@ app.post('/receive-imessage', async (req, res) => {
                 'inbound',
                 chatKey,
                 groupId,
-                author || chatKey,
+                displayName,
                 message || '',
                 localAttachmentPaths.length > 0 ? 1 : 0,
                 messageGuid ? String(messageGuid) : null,
@@ -1043,5 +1156,98 @@ async function handleRestartCommand(sendReply, arg = '') {
     await sendReply("🔄 Restarting Signal-iMessage gateway daemon in 1s...");
     saveRestartMarker(sendReply.target, false);
     restartSelf(1500);
+}
+
+// --- Contact / Nickname Management Commands ---
+async function handleNameCommand(sendReply, text, currentChatTarget = null, groupId = null) {
+    const parts = text.trim().split(/\s+/);
+    const args = parts.slice(1);
+
+    // List contacts if /names, /contacts, or /name with no arguments
+    if (args.length === 0) {
+        loadContacts();
+        const entries = Object.entries(contactsMap);
+        if (entries.length === 0) {
+            return await sendReply("No contacts configured yet. Use /name <number_or_email> <nickname> or edit contacts.json.");
+        }
+        const list = entries.map(([handle, name]) => `• ${name}: ${handle}`).join('\n');
+        return await sendReply(`Contacts & Nicknames (${entries.length}):\n${list}`);
+    }
+
+    // Single argument: /name <nickname> (inside a 1-on-1 thread)
+    if (args.length === 1) {
+        const nickname = args[0];
+        if (currentChatTarget && !currentChatTarget.startsWith('chat') && !currentChatTarget.includes(';+;')) {
+            contactsMap[currentChatTarget] = nickname;
+            saveContacts();
+
+            if (groupId) {
+                try {
+                    await sendRpcCommand("updateGroup", {
+                        groupId: groupId,
+                        name: `iMessage: ${nickname}`
+                    });
+                } catch (e) {
+                    console.warn("[Signal] Could not rename group:", e.message);
+                }
+            }
+            return await sendReply(`✅ Saved contact: ${nickname} (${currentChatTarget})`);
+        } else {
+            return await sendReply("Usage: /name <phone_or_email> <nickname>\nExample: /name +15551234567 Alice");
+        }
+    }
+
+    // Two or more arguments: /name <handle> <nickname...>
+    const rawHandle = args[0];
+    const handle = rawHandle.replace(/^(iMessage|SMS);-;/i, '').replace(/^tel:/i, '').trim();
+    const nickname = args.slice(1).join(' ').trim();
+
+    contactsMap[handle] = nickname;
+    saveContacts();
+
+    // If there is an existing 1-on-1 group mapped to this handle, rename it
+    if (groupMap[handle]) {
+        try {
+            await sendRpcCommand("updateGroup", {
+                groupId: groupMap[handle],
+                name: `iMessage: ${nickname}`
+            });
+        } catch (e) {}
+    }
+
+    return await sendReply(`✅ Saved contact: ${nickname} (${handle})`);
+}
+
+async function handleDeleteNameCommand(sendReply, text) {
+    const parts = text.trim().split(/\s+/);
+    const rawHandle = parts[1]?.trim();
+    if (!rawHandle) {
+        return await sendReply("Usage: /delname <phone_or_email>");
+    }
+    const handle = rawHandle.replace(/^(iMessage|SMS);-;/i, '').replace(/^tel:/i, '').trim();
+    loadContacts();
+
+    let foundKey = null;
+    if (contactsMap[handle]) {
+        foundKey = handle;
+    } else {
+        const lower = handle.toLowerCase();
+        const digits = handle.replace(/\D/g, '');
+        for (const k of Object.keys(contactsMap)) {
+            if (k.toLowerCase() === lower || (digits.length >= 7 && k.replace(/\D/g, '') === digits)) {
+                foundKey = k;
+                break;
+            }
+        }
+    }
+
+    if (foundKey) {
+        const oldName = contactsMap[foundKey];
+        delete contactsMap[foundKey];
+        saveContacts();
+        return await sendReply(`🗑️ Removed contact for ${oldName} (${foundKey})`);
+    } else {
+        return await sendReply(`⚠️ Contact not found: ${handle}`);
+    }
 }
 

@@ -40,7 +40,8 @@ A lightweight bidirectional gateway bridging Signal and Apple iMessage. It allow
 - **Reaction (Tapback) Routing**: Signal emoji reactions (❤️, 👍, 👎, 😂, ‼️, ❓) are mapped directly to native Apple Tapbacks (Love, Like, Dislike, Laugh, Emphasize, Question) in both 1-on-1 and group chats.
 - **Persistent State**: SQLite database (`messages.db`) with WAL mode stores thread rosters, message history, and maps Signal timestamps to Apple message GUIDs.
 - **Dedicated Signal Groups**: Every iMessage contact or group chat maps to a private Signal group between you and the gateway bot. You can rename the groups anytime in Signal without breaking routing.
-- **Interactive Commands**: Test round-trip health check anytime (`are you there?` or `/ping`), restart services (`/restart`, `/restart both`, `/restart mac`), inspect group rosters (`/info` or `/members`), and link new contacts (`/new <number>`).
+- **Sender Attribution & Contacts Book**: Supports a local `contacts.json` book to map raw phone numbers and emails to friendly nicknames (e.g. `[Alice]: "Sounds great!"` instead of `[+15551234567]: "Sounds great!"`). Manage contacts directly via Signal commands (`/name`, `/contacts`) or by editing `contacts.json`.
+- **Interactive Commands**: Test round-trip health check anytime (`are you there?` or `/ping`), restart services (`/restart`, `/restart both`, `/restart mac`), manage contact nicknames (`/name`, `/contacts`, `/delname`), inspect group rosters (`/info` or `/members`), and link new contacts (`/new <number>`).
 
 ---
 
@@ -339,6 +340,8 @@ Supported on both the gateway and Mac relay daemon to trigger service reboots re
 ├── ecosystem.config.js    # PM2 process configuration
 ├── config.json            # Active credentials and networking config (gitignored)
 ├── config.example.json    # Template configuration file
+├── contacts.json          # Mapping of phone numbers/emails to nicknames (gitignored)
+├── contacts.example.json  # Template contacts file
 ├── groups.json            # Mapping of phone numbers/groups to Signal group IDs (gitignored)
 ├── messages.db            # SQLite database for threads, message history & Apple GUID mappings (gitignored)
 ├── scripts/

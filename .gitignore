@@ -1,6 +1,7 @@
 # Secrets and Credentials
 config.json
 groups.json
+contacts.json
 
 # Database files
 messages.db
